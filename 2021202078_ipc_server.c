@@ -32,11 +32,14 @@
 #include <fnmatch.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/select.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 
 struct ClientInfo {
 
@@ -48,9 +51,10 @@ struct ClientInfo {
 };
 
 int request;
-int IdleProcessCount;
+int* IdleProcessCount;
 struct ClientInfo client_info[10];
 static pid_t *pids;
+pthread_mutex_t counter_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 pid_t child_make(int i, int socketfd, int addrlen);
 void parentSignalHandler(int sig);
@@ -88,12 +92,12 @@ int main() {
     struct sigaction sigAct;                      // 시그널 처리를 위한 구조체
     sigset_t mask;                                // 시그널 집합
     time_t t;                                     // 시간을 저장하는 변수
-    char temp[BUFSIZE];                           // 임시 문자열 배열
+    char timeBuf[BUFSIZE];                           // 임시 문자열 배열
     char line[BUFSIZE];
     int socket_fd, client_fd;                     // 소켓 및 클라이언트의 파일 디스크립터
-    int MaxChilds, MaxIdleNum, MinIdleNum, StartServers, MaxHistory;
+    int MaxChilds, MaxIdleNum, MinIdleNum, StartProcess, MaxHistory;
+    int shm_id;
     request = 0;                                  // 클라이언트와의 연결 횟수
-    IdleProcessCount = 0;
 
     FILE *file = fopen("httpd.conf", "r");
    
@@ -101,7 +105,7 @@ int main() {
         sscanf(line, "MaxChilds: %d", &MaxChilds);
         sscanf(line, "MaxIdleNum: %d", &MaxIdleNum);
         sscanf(line, "MinIdleNum: %d", &MinIdleNum);
-        sscanf(line, "StartServers: %d", &StartServers);
+        sscanf(line, "StartProcess: %d", &StartProcess);
         sscanf(line, "MaxHistory: %d", &MaxHistory);
     }
 
@@ -127,8 +131,8 @@ int main() {
     else {
         time(&t);  // 현재 시간을 t 변수에 저장
         lt = localtime(&t);  // t 변수를 이용해 로컬 시간 구조체 포인터를 얻음
-        strftime(temp, 1024, "%c", lt);  // 로컬 시간을 temp 문자열에 포맷팅하여 저장
-        printf("[%s] Server is started\n", temp);  // temp 문자열을 이용하여 서버 시작 메시지 출력
+        strftime(timeBuf, 1024, "%c", lt);  // 로컬 시간을 timeBuf 문자열에 포맷팅하여 저장
+        printf("[%s] Server is started\n", timeBuf);  // timeBuf 문자열을 이용하여 서버 시작 메시지 출력
     }
 
     if(listen(socket_fd, 5) == -1) { // 클라이언트와의 연결 대기
@@ -136,14 +140,26 @@ int main() {
         return 0; //프로그램 종료
     }
 
+    if((shm_id = shmget((key_t)PORTNO, BUFSIZE, IPC_CREAT|0666)) == -1) {      
+        printf("shmget fail\n");
+        return 0;
+    }
+
+    if((IdleProcessCount = (int*)shmat(shm_id, (void*)0, 0)) == (void*)-1) {       
+        printf("shmat fail\n");
+        return 0;
+    }
+
+    *IdleProcessCount = 0;
+
     signal(SIGALRM, parentSignalHandler); //alarm에 대한 action 설정
     signal(SIGINT, parentSignalHandler); //init에 대한 action 설정
     alarm(10); //10초 뒤 alarm
 
-    pids = (pid_t *)malloc(MaxChilds * sizeof(pid_t)); //pid 배열을 10 크기로 동적할당
+    pids = (pid_t *)malloc(StartProcess * sizeof(pid_t)); //pid 배열을 10 크기로 동적할당
     int addrlen = sizeof(client_addr); //client_addr의 사이즈를 addrlen에 저장
 
-    for(int i = 0; i < MaxChilds; i++) //pids 배열을 돌면서
+    for(int i = 0; i < StartProcess; i++) //pids 배열을 돌면서
         pids[i] = child_make(1, socket_fd, addrlen); //child_make 함수를 실행(fork)
 
     for(;;) //부모 프로세스 멈추기
@@ -198,11 +214,27 @@ void child_main(int i, int socket_fd, int addrlen)
     char curTime[BUFSIZE]; // 임시 문자열 버퍼
     unsigned int len; // 클라이언트 주소의 길이
     int client_fd; // 클라이언트의 파일 디스크립터
+    int shm_id;
+
+    pthread_mutex_lock(&counter_mutex);
+    
+    if((shm_id = shmget((key_t)PORTNO, BUFSIZE, IPC_CREAT|0666)) == -1) {      
+        printf("shmget fail\n");
+        exit(0);
+    }
+
+    if((IdleProcessCount = (int*)shmat(shm_id, (void*)0, 0)) == (void*)-1) {       
+        printf("shmat fail\n");
+        exit(0);
+    }
 
     time(&t); // 현재 시간 저장
     lt = localtime(&t); // 현재 시간의 로컬 시간 정보 저장
     strftime(curTime, 1024, "%c", lt); // 시간 정보를 문자열로 변환하여 temp에 저장
     printf("[%s] %ld process is forked.\n", curTime, (long)getpid()); // 포크된 프로세스의 정보 출력
+    (*IdleProcessCount)++;
+    printf("[%s] IdleProcessCount : %d\n", curTime, *IdleProcessCount);
+
     signal(SIGUSR1, childSignalHandler); // SIGUSR1 시그널 핸들러 등록
     signal(SIGTERM, childSignalHandler); // SIGTERM 시그널 핸들러 등록
 
@@ -246,25 +278,26 @@ void child_main(int i, int socket_fd, int addrlen)
         if(isExist(client_fd, response_header, url) == 1) //존재하지 않는 디렉토리에 대한 접근
             continue; // 무시 후 다시 연결 받기
 
-        IdleProcessCount--;
+        (*IdleProcessCount)--;
         time(&t);  // 현재 시간을 t 변수에 저장
         lt = localtime(&t);  // t 변수를 이용해 로컬 시간 구조체 포인터를 얻음
         strftime(curTime, 1024, "%c", lt);  // 로컬 시간을 temp 문자열에 포맷팅하여 저장
         printf("========= New Client ============\n[%s]\nIP : %s\nPort : %d\n=================================\n", curTime, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port)); // 연결된 클라이언트의 IP 주소 및 포트 번호 출력
-        printf("[%s] IdleProcessCount : %d\n", curTime, IdleProcessCount);
+        printf("[%s] IdleProcessCount : %d\n", curTime, *IdleProcessCount);
         sendResponse(url, response_header, client_fd); //아닌 경우, response 메세지 입력 및 출력
 
         ++request; // 누적 접속 기록 개수 증가
         saveConnectHistory(client_addr);
 
         close(client_fd); //client file descriptor 닫기
-        IdleProcessCount++;
+        (*IdleProcessCount)++;
         time(&t);  // 현재 시간을 t 변수에 저장
         lt = localtime(&t);  // t 변수를 이용해 로컬 시간 구조체 포인터를 얻음
         strftime(curTime, 1024, "%c", lt);  // 로컬 시간을 temp 문자열에 포맷팅하여 저장
         printf("====== Disconnected Client ======\n[%s]\nIP : %s\nPort : %d\n=================================\n", curTime, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port)); // 연결 해제된 클라이언트의 IP 주소 및 포트 번호 출력
-        printf("[%s] IdleProcessCount : %d\n", curTime, IdleProcessCount);
+        printf("[%s] IdleProcessCount : %d\n", curTime, *IdleProcessCount);
     }
+    pthread_mutex_unlock(&counter_mutex);
     return; //프로그램 종료
 }
 
@@ -282,7 +315,7 @@ void parentSignalHandler(int sig) {
 
         printf("\n========= Connection History ===================================\n"); //history title
         printf("No.\tIP\t\tPID\tPORT\tTIME\n"); //history의 세부 항목
-        for(int i = 0; i < 5; i++) //자식 프로세스 만큼 반복
+        for(int i = 0; i < *IdleProcessCount; i++) //자식 프로세스 만큼 반복
             kill(pids[i], SIGUSR1); //자식 프로세스에 신호 전달
         alarm(10); //다시 10초 알람 설정
     }
@@ -295,11 +328,11 @@ void parentSignalHandler(int sig) {
         int *status;                // 자식 프로세스의 종료 상태를 저장할 포인터
 
 
-        for (int i = 0; i < 5; i++) //자식 프로세스 만큼 반복
+        for (int i = 0; i < *IdleProcessCount; i++) //자식 프로세스 만큼 반복
             kill(pids[i], SIGTERM); //자식 프로세스에 신호 전달
-        for (int i = 0; i < 5; i++) //자식 프로세스 만큼 반복
+        for (int i = 0; i < *IdleProcessCount; i++) //자식 프로세스 만큼 반복
             waitpid(pids[i], status, WNOHANG); //terminate된 자식 프로세스 수거
-        for (int i = 0; i < 5; i++) { //자식 프로세스 만큼 반복
+        for (int i = 0; i < *IdleProcessCount; i++) { //자식 프로세스 만큼 반복
             time(&t);  // 현재 시간을 t 변수에 저장
             lt = localtime(&t);  // t 변수를 이용해 로컬 시간 구조체 포인터를 얻음
             strftime(curTime, 1024, "%c", lt);  // 로컬 시간을 curTime 문자열에 포맷팅하여 저장
@@ -372,7 +405,6 @@ void saveConnectHistory(struct sockaddr_in client_addr) {
     client_info[n].No = request;                                      // 클라이언트 요청 번호를 저장
     client_info[n].PID = getpid();                                    // 클라이언트의 프로세스 ID를 저장
     client_info[n].Port = ntohs(client_addr.sin_port);                // 클라이언트의 포트 번호를 저장
-
     
     time(&t); // 현재 시간 저장
     lt = localtime(&t); // 현재 시간의 로컬 시간 정보 저장
