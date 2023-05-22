@@ -19,7 +19,6 @@
 #define BUFSIZE 1024
 #define PORTNO 40000
 #define SEND_ARRAY_LEN 99999
-#define MAX_CHILDS 10
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,6 +48,7 @@ struct ClientInfo {
 };
 
 int request;
+int IdleProcessCount;
 struct ClientInfo client_info[10];
 static pid_t *pids;
 
@@ -89,8 +89,21 @@ int main() {
     sigset_t mask;                                // 시그널 집합
     time_t t;                                     // 시간을 저장하는 변수
     char temp[BUFSIZE];                           // 임시 문자열 배열
+    char line[BUFSIZE];
     int socket_fd, client_fd;                     // 소켓 및 클라이언트의 파일 디스크립터
+    int MaxChilds, MaxIdleNum, MinIdleNum, StartServers, MaxHistory;
     request = 0;                                  // 클라이언트와의 연결 횟수
+    IdleProcessCount = 0;
+
+    FILE *file = fopen("httpd.conf", "r");
+   
+    while (fgets(line, sizeof(line), file) != NULL) {
+        sscanf(line, "MaxChilds: %d", &MaxChilds);
+        sscanf(line, "MaxIdleNum: %d", &MaxIdleNum);
+        sscanf(line, "MinIdleNum: %d", &MinIdleNum);
+        sscanf(line, "StartServers: %d", &StartServers);
+        sscanf(line, "MaxHistory: %d", &MaxHistory);
+    }
 
     sigAct.sa_handler = childSignalHandler; //SIGUSR1 Signaling Function Registration
     sigemptyset(&sigAct.sa_mask);
@@ -127,10 +140,10 @@ int main() {
     signal(SIGINT, parentSignalHandler); //init에 대한 action 설정
     alarm(10); //10초 뒤 alarm
 
-    pids = (pid_t *)malloc(MAX_CHILDS * sizeof(pid_t)); //pid 배열을 5 크기로 동적할당
+    pids = (pid_t *)malloc(MaxChilds * sizeof(pid_t)); //pid 배열을 10 크기로 동적할당
     int addrlen = sizeof(client_addr); //client_addr의 사이즈를 addrlen에 저장
 
-    for(int i = 0; i < 5; i++) //pids 배열을 돌면서
+    for(int i = 0; i < MaxChilds; i++) //pids 배열을 돌면서
         pids[i] = child_make(1, socket_fd, addrlen); //child_make 함수를 실행(fork)
 
     for(;;) //부모 프로세스 멈추기
@@ -233,17 +246,24 @@ void child_main(int i, int socket_fd, int addrlen)
         if(isExist(client_fd, response_header, url) == 1) //존재하지 않는 디렉토리에 대한 접근
             continue; // 무시 후 다시 연결 받기
 
+        IdleProcessCount--;
         time(&t);  // 현재 시간을 t 변수에 저장
         lt = localtime(&t);  // t 변수를 이용해 로컬 시간 구조체 포인터를 얻음
         strftime(curTime, 1024, "%c", lt);  // 로컬 시간을 temp 문자열에 포맷팅하여 저장
         printf("========= New Client ============\n[%s]\nIP : %s\nPort : %d\n=================================\n", curTime, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port)); // 연결된 클라이언트의 IP 주소 및 포트 번호 출력
+        printf("[%s] IdleProcessCount : %d\n", curTime, IdleProcessCount);
         sendResponse(url, response_header, client_fd); //아닌 경우, response 메세지 입력 및 출력
 
         ++request; // 누적 접속 기록 개수 증가
         saveConnectHistory(client_addr);
 
         close(client_fd); //client file descriptor 닫기
+        IdleProcessCount++;
+        time(&t);  // 현재 시간을 t 변수에 저장
+        lt = localtime(&t);  // t 변수를 이용해 로컬 시간 구조체 포인터를 얻음
+        strftime(curTime, 1024, "%c", lt);  // 로컬 시간을 temp 문자열에 포맷팅하여 저장
         printf("====== Disconnected Client ======\n[%s]\nIP : %s\nPort : %d\n=================================\n", curTime, inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port)); // 연결 해제된 클라이언트의 IP 주소 및 포트 번호 출력
+        printf("[%s] IdleProcessCount : %d\n", curTime, IdleProcessCount);
     }
     return; //프로그램 종료
 }
@@ -800,7 +820,7 @@ int compareStringUpper(char* fileName1, char* fileName2) {
 // purpose: Printing file permissions for user, group, and others.                   //
 ///////////////////////////////////////////////////////////////////////////////////////
 void printPermissions(mode_t mode, char* sendArray) {
-    
+
     sprintf(sendArray, "%s%c", sendArray, (mode & S_IRUSR) ? 'r' : '-'); //user-read
     sprintf(sendArray, "%s%c", sendArray, (mode & S_IWUSR) ? 'w' : '-'); //user-write
     sprintf(sendArray, "%s%c", sendArray, (mode & S_IXUSR) ? 'x' : '-'); //user-execute
